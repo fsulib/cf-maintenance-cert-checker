@@ -2,7 +2,7 @@ This stack that launches two scheduled lambdas that check certificates in Amazon
 
 CertAuditRunner provides a bi-weekly check for any certs that will expire within 30 days.
 
-CertReportRunner provides a quarterly report of all certs and their remaining lifespans.
+CertReportRunner provides a quarterly report of all certs and their remaining life spans.
 
 Supply parameters to adjust job run frequency, the trigger threshold for expiration warnings, and whether to run either, both, or neither function.
 
