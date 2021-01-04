@@ -1,0 +1,242 @@
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  This template creates a lambda that checks certificate expiration dates
+  triggered by a CloudWatch cron job. It also creates two notification topics,
+  one for imminent expiration warnings, and one for general reporting of
+  all certificates' remaining lifespan in days.
+
+Parameters:
+
+  Creator: 
+    Type: String
+    Description: >
+      Who is launching this stack? AWS IAM username.
+
+  AuditCronSpec:
+    Description: >
+      The cron specification that will trigger the audit lambda. Time is in UTC, 
+      which is five hours ahead of EST. The cron spec has six components corresponding
+      to Minute Hour DayOfMonth Month DayOfWeek Year.
+    Type: String
+    Default: 0 7 1,14 * ? *
+    AllowedPattern: '(([0-9]{1,2}|[0-9*?,-/LW#]+|[A-Z,-]{3,})( )?){6}'
+    ConstraintDescription: >
+      This has to be an _Amazon_ cron specifiction.
+
+  TopicSubscriptionEmail:
+    Description: >
+      Who receives notifications for audits and reports?
+    Type: String
+    AllowedPattern: '[a-z0-9-]+@fsu.edu'
+    ConstraintDescription: 'FSU email addresses only, please.'
+    Default: lib-sysadmins@fsu.edu
+
+  AuditScheduleState:
+    Description: >
+      Enable cert audits?
+    Type: String
+    Default: ENABLED
+    AllowedValues: 
+      - ENABLED
+      - DISABLED
+
+  ReportScheduleState:
+    Description: >
+      Enable cert reports?
+    Type: String
+    Default: ENABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+
+  ReportCronSpec:
+    Description: >
+      The cron specification that will trigger the report lambda. Time is in UTC, 
+      which is five hours ahead of EST. The cron spec has six components corresponding
+      to Minute Hour DayOfMonth Month DayOfWeek Year.
+    Type: String
+    Default: 0 7 1 JAN,APR,JUL,OCT ? *
+    AllowedPattern: '(([0-9]{1,2}|[0-9*?,-/LW#]+|[A-Z,-]{3,})( )?){6}'
+    ConstraintDescription: >
+      This has to be an _Amazon_ cron specifiction.
+
+  region:
+    Description: >
+      In which region are we checking our certificates?
+    Type: String
+    Default: us-east-1
+
+  days:
+    Description: >
+      The age threshold for certs. A cert with fewer than 'days' left in its lifespan
+      will be reported in an audit run.
+    Type: String
+    Default: 30
+    AllowedPattern: '[0-9]{1,3}'
+    ConstraintDescription: >
+      Please supply a number between 1 and 999.
+
+  audit:
+    Description: >
+      Do a cert audit, meaning check whether a cert will expire within the 'days' threshold.
+    Type: String
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Default: "Yes"
+    ConstraintDescription: >
+      Do you or don't you? Yes or No, it isn't that difficult.
+
+  report:
+    Description: >
+      Do a general report of remaining cert validity time.
+    Type: String
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Default: "No"
+    ConstraintDescription: >
+      Yes or No. Pretty simple.
+  
+Resources:
+
+  CertAuditRunner:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: CheckCerts.check_certs
+      Runtime: python3.7
+      FunctionName: Infra-AuditCerts
+      CodeUri: check_certs/
+      Role: !GetAtt CertCheckIamRole.Arn
+      Description: >
+        Performs a certificate lifespan audit and notifies if a cert's remaining
+        days of validity fall beneath the 'days' threshold.
+      MemorySize: 128
+      Timeout: 15
+      Tags:
+        "Name": "Infra-AuditCerts"
+        "lib:createdBy": !Ref Creator
+        "lib:app": "infrastructure"
+        "lib:env": "all"
+      Environment:
+        Variables:
+          region: !Ref region
+          days: !Ref days
+          doAudit: !Ref audit
+          doReport: "False"
+          snsAuditArn: !Ref CertCheckSnsTopic
+  
+  CertReportRunner:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: CheckCerts.check_certs
+      Runtime: python3.7
+      FunctionName: Infra-ReportCerts
+      CodeUri: check_certs/
+      Role: !GetAtt CertCheckIamRole.Arn
+      Description: >
+        Reports on the days remaining for our certificates' validity.
+      MemorySize: 128
+      Timeout: 15
+      Tags:
+        "Name": "Infra-ReportCerts"
+        "lib:createdBy": !Ref Creator
+        "lib:app": "infrastructure"
+        "lib:env": "all"
+      Environment:
+        Variables:
+          region: !Ref region
+          doReport: !Ref report
+          doAudit: "False"
+          snsReportArn: !Ref CertCheckSnsTopic
+
+  CertCheckIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Path: '/lambda_roles/'
+      Policies:
+        - PolicyName: CertCheckLambdaPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'acm:ListCertificates'
+                  - 'acm:DescribeCertificate'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref CertCheckSnsTopic
+
+  CertReportSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: >
+        Invokes the Cert Report lambda.
+      ScheduleExpression: !Sub cron(${ReportCronSpec})
+      State: !Ref ReportScheduleState
+      Targets:
+        - Arn: !GetAtt CertReportRunner.Arn
+          Id: Infrastructure-CertReportRunner
+
+  CertAuditSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: >
+        Invokes the Cert Audit lambda.
+      ScheduleExpression: !Sub cron(${AuditCronSpec})
+      State: !Ref AuditScheduleState
+      Targets:
+        - Arn: !GetAtt CertAuditRunner.Arn
+          Id: Infrastructure-CertAuditRunner
+      
+  CertReportLambdaPermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CertReportRunner.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CertReportSchedule.Arn
+
+  CertAuditLambdaPermissions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CertAuditRunner.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CertAuditSchedule.Arn
+
+  CertCheckSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: libCertChecker
+      Subscription:
+        - Endpoint: !Ref TopicSubscriptionEmail
+          Protocol: email
+      Tags:
+        - Key: Name
+          Value: CertCheckSnsTopic
+        - Key: lib:created-by
+          Value: !Ref Creator
+        - Key: lib:env
+          Value: infrastructure
+        - Key: lib:app
+          Value: all
+
